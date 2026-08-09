@@ -1,0 +1,17 @@
+node_modules/
+dist/
+data/
+backups/
+coverage/
+test-results/
+playwright-report/
+.env
+.env.*
+!.env.example
+.agents/
+.codex/
+*.log
+*.orig
+*.rej
+*.bak
+.DS_Store
