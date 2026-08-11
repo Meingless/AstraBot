@@ -2,9 +2,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { decryptTranscript, encryptTranscript, encryptionAvailable } from "./crypto.js";
 
 const previous = process.env.DATA_ENCRYPTION_KEY;
+const previousRotationKeys = process.env.DATA_ENCRYPTION_PREVIOUS_KEYS;
 afterEach(() => {
   if (previous === undefined) delete process.env.DATA_ENCRYPTION_KEY;
   else process.env.DATA_ENCRYPTION_KEY = previous;
+  if (previousRotationKeys === undefined) delete process.env.DATA_ENCRYPTION_PREVIOUS_KEYS;
+  else process.env.DATA_ENCRYPTION_PREVIOUS_KEYS = previousRotationKeys;
 });
 
 describe("ticket transcript encryption", () => {
@@ -34,5 +37,18 @@ describe("ticket transcript encryption", () => {
     expect(() =>
       decryptTranscript({ ...encrypted, tag: Buffer.alloc(16).toString("base64") }, "guild:7"),
     ).toThrow();
+  });
+
+  it("decrypts existing transcripts during key rotation while encrypting with the active key", () => {
+    const oldKey = Buffer.alloc(32, 10).toString("base64");
+    const newKey = Buffer.alloc(32, 11).toString("base64");
+    process.env.DATA_ENCRYPTION_KEY = oldKey;
+    const encryptedWithOldKey = encryptTranscript("rotating", "guild:rotation");
+    process.env.DATA_ENCRYPTION_KEY = newKey;
+    process.env.DATA_ENCRYPTION_PREVIOUS_KEYS = oldKey;
+    expect(decryptTranscript(encryptedWithOldKey, "guild:rotation")).toBe("rotating");
+    const encryptedWithNewKey = encryptTranscript("current", "guild:rotation");
+    delete process.env.DATA_ENCRYPTION_PREVIOUS_KEYS;
+    expect(decryptTranscript(encryptedWithNewKey, "guild:rotation")).toBe("current");
   });
 });

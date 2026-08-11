@@ -25,10 +25,31 @@ function validBase64Key(value: string | undefined) {
   }
 }
 
-function positiveNumber(env: NodeJS.ProcessEnv, key: string, fallback: number) {
+function boundedNumber(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  fallback: number,
+  maximum: number,
+) {
   const value = Number(env[key] || fallback);
-  if (!Number.isFinite(value) || value <= 0)
-    throw new Error(`${key} must be a positive number`);
+  if (!Number.isFinite(value) || value <= 0 || value > maximum)
+    throw new Error(`${key} must be greater than 0 and at most ${maximum}`);
+}
+
+function configuredKeys(env: NodeJS.ProcessEnv, key: string) {
+  return (env[key] || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function validatePreviousKeys(env: NodeJS.ProcessEnv, key: string) {
+  const values = configuredKeys(env, key);
+  if (values.some((value) => !validBase64Key(value)))
+    throw new Error(`${key} must contain only comma-separated base64-encoded 32-byte keys`);
+  if (new Set(values).size !== values.length)
+    throw new Error(`${key} must not contain duplicate keys`);
+  return values;
 }
 
 export function validateRuntimeConfig(
@@ -54,19 +75,35 @@ export function validateRuntimeConfig(
       throw new Error("METRICS_TOKEN and SESSION_SECRET must be different");
     if (!validBase64Key(env.DATA_ENCRYPTION_KEY))
       throw new Error("DATA_ENCRYPTION_KEY must be a base64-encoded 32-byte key");
+    const dataKeys = [
+      env.DATA_ENCRYPTION_KEY!.trim(),
+      ...validatePreviousKeys(env, "DATA_ENCRYPTION_PREVIOUS_KEYS"),
+    ];
+    if (new Set(dataKeys).size !== dataKeys.length)
+      throw new Error("DATA_ENCRYPTION_PREVIOUS_KEYS must not repeat the active data key");
+    let backupKeys: string[] = [];
     if (env.BACKUP_ENABLED === "true") {
       if (!validBase64Key(env.BACKUP_ENCRYPTION_KEY))
         throw new Error(
           "BACKUP_ENCRYPTION_KEY must be a base64-encoded 32-byte key when backups are enabled",
         );
-      if (Buffer.from(env.BACKUP_ENCRYPTION_KEY!, "base64").equals(
-        Buffer.from(env.DATA_ENCRYPTION_KEY!, "base64"),
-      ))
-        throw new Error("BACKUP_ENCRYPTION_KEY must differ from DATA_ENCRYPTION_KEY");
-      positiveNumber(env, "BACKUP_INTERVAL_HOURS", 24);
-      positiveNumber(env, "BACKUP_RETENTION_DAYS", 7);
+      backupKeys = [
+        env.BACKUP_ENCRYPTION_KEY!.trim(),
+        ...validatePreviousKeys(env, "BACKUP_ENCRYPTION_PREVIOUS_KEYS"),
+      ];
+      if (new Set(backupKeys).size !== backupKeys.length)
+        throw new Error("BACKUP_ENCRYPTION_PREVIOUS_KEYS must not repeat the active backup key");
+      boundedNumber(env, "BACKUP_INTERVAL_HOURS", 24, 168);
+      boundedNumber(env, "BACKUP_RETENTION_DAYS", 7, 3_650);
+    } else if (env.BACKUP_ENCRYPTION_PREVIOUS_KEYS?.trim()) {
+      throw new Error("BACKUP_ENCRYPTION_PREVIOUS_KEYS requires BACKUP_ENABLED=true");
     }
+    const dataKeyBytes = dataKeys.map((value) => Buffer.from(value, "base64").toString("hex"));
+    const backupKeyBytes = backupKeys.map((value) => Buffer.from(value, "base64").toString("hex"));
+    if (backupKeyBytes.some((value) => dataKeyBytes.includes(value)))
+      throw new Error("Backup encryption keys must differ from data encryption keys");
     const s3Keys = [
+      "BACKUP_S3_ENDPOINT",
       "BACKUP_S3_BUCKET",
       "BACKUP_S3_REGION",
       "BACKUP_S3_ACCESS_KEY_ID",
@@ -75,7 +112,7 @@ export function validateRuntimeConfig(
     const configuredS3Keys = s3Keys.filter((key) => Boolean(env[key]?.trim()));
     if (configuredS3Keys.length > 0 && configuredS3Keys.length !== s3Keys.length)
       throw new Error(`S3 backup configuration requires ${s3Keys.join(", ")}`);
-    if (env.BACKUP_S3_ENDPOINT) {
+    if (env.BACKUP_S3_ENDPOINT?.trim()) {
       let endpoint: URL;
       try {
         endpoint = new URL(env.BACKUP_S3_ENDPOINT);

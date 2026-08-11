@@ -64,6 +64,16 @@ describe("SQLite repositories and migrations", () => {
     expect(database.listTickets("guild-filter", { before: second.id })).toHaveLength(1);
   });
 
+  it("treats LIKE wildcards in ticket search queries as literals", () => {
+    database.createTicket("guild-wildcard", "wild-1", "owner-w1", "C_3PO");
+    database.createTicket("guild-wildcard", "wild-2", "owner-w2", "C-3PO");
+    expect(
+      database.listTickets("guild-wildcard", { query: "C_3PO" })
+        .map((item) => item.ownerName),
+    ).toEqual(["C_3PO"]);
+    expect(database.listTickets("guild-wildcard", { query: "100%" })).toHaveLength(0);
+  });
+
   it("stores sessions and expires them", () => {
     const session = {
       user: { id: "user", username: "astra", avatar: null },
@@ -83,6 +93,7 @@ describe("SQLite repositories and migrations", () => {
     expect(database.getSession("active")).toBeNull();
     database.createSession("expired", { ...session, expiresAt: Date.now() - 1 });
     expect(database.getSession("expired")).toBeNull();
+    expect(database.purgeExpiredSessions()).toBe(1);
   });
 
   it("scopes reaction roles and custom commands to guilds", () => {
@@ -116,6 +127,50 @@ describe("SQLite repositories and migrations", () => {
     expect(database.listAllCases("guild-history")).toHaveLength(1);
     expect(database.listAllAuditEvents("guild-history")[0]?.metadata)
       .toEqual({ changedFields: ["locale"] });
+  });
+
+  it("enforces tenant history, ticket rate, and transcript storage limits", () => {
+    const guildId = "guild-limits";
+    for (let index = 0; index <= database.STORAGE_LIMITS.auditEventsPerGuild; index += 1)
+      database.addAuditEvent(guildId, "actor", "bounded.audit", {
+        metadata: { index },
+      });
+    expect(database.listAllAuditEvents(guildId)).toHaveLength(
+      database.STORAGE_LIMITS.auditEventsPerGuild,
+    );
+    for (let index = 0; index <= database.STORAGE_LIMITS.moderationCasesPerGuild; index += 1)
+      database.addCase(guildId, `target-${index}`, "moderator", "warn", "reason");
+    expect(database.listAllCases(guildId)).toHaveLength(
+      database.STORAGE_LIMITS.moderationCasesPerGuild,
+    );
+
+    for (let index = 0; index < database.STORAGE_LIMITS.ticketsPerOwnerPerDay; index += 1) {
+      const ticket = database.createTicket(
+        guildId,
+        `rate-channel-${index}`,
+        "rate-owner",
+        "Rate Owner",
+      );
+      database.closeTicket(guildId, ticket.id, null, null);
+    }
+    expect(() => database.createTicket(
+      guildId,
+      "rate-channel-rejected",
+      "rate-owner",
+      "Rate Owner",
+    )).toThrow(/daily ticket limit/u);
+
+    const transcriptTicket = database.createTicket(
+      guildId,
+      "large-transcript",
+      "another-owner",
+      "Another Owner",
+    );
+    expect(() => database.closeTicket(guildId, transcriptTicket.id, {
+      ciphertext: "x".repeat(database.STORAGE_LIMITS.transcriptPlaintextBytes * 2),
+      nonce: "nonce",
+      tag: "tag",
+    }, Date.now() + 1000)).toThrow(/per-ticket storage limit/u);
   });
 
   it("enforces subscription expiry, plan capabilities, and AI quota limits", async () => {

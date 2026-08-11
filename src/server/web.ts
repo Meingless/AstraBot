@@ -8,8 +8,14 @@ import express, {
   type Response,
 } from "express";
 import helmet from "helmet";
-import { ChannelType, PermissionFlagsBits } from "discord.js";
+import {
+  ChannelType,
+  PermissionFlagsBits,
+  type Guild,
+  type Role,
+} from "discord.js";
 import { archiveTicketFromDashboard, bot } from "./bot.js";
+import { backupHealthy } from "./backup.js";
 import { assertAiConnectionAllowed } from "./ai.js";
 import { defaultConfig, sanitizeConfig, type SetupTemplate } from "./config.js";
 import {
@@ -48,6 +54,11 @@ import {
 } from "./database.js";
 import { decryptTranscript, encryptionAvailable } from "./crypto.js";
 import { emojiKey, normalizeEmoji } from "./discord/emoji.js";
+import {
+  autoRoleError,
+  hasConfiguredRole,
+  isConfigurableRole,
+} from "./discord/roles.js";
 import { metricsText, requestTelemetry, log as structuredLog } from "./observability.js";
 import { getPlanAccess, preserveLockedConfig } from "./plans.js";
 import { previewTemplate } from "./templates.js";
@@ -135,6 +146,97 @@ function isGuildOwner(req: AuthedRequest) {
   );
 }
 
+type ConfigRoleValidation =
+  | { ok: true }
+  | { ok: false; status: 400 | 403; error: string };
+
+async function validateConfigRoles(
+  guild: Guild,
+  actorId: string,
+  existing: ReturnType<typeof getGuildConfig>,
+  requested: ReturnType<typeof getGuildConfig>,
+): Promise<ConfigRoleValidation> {
+  const actor = guild.ownerId === actorId
+    ? null
+    : await guild.members.fetch(actorId).catch(() => null);
+  if (guild.ownerId !== actorId && !actor)
+    return { ok: false, status: 403, error: "Current Discord membership is required" };
+
+  const accessFieldsChanged =
+    JSON.stringify(existing.dashboardAdminRoleIds) !==
+      JSON.stringify(requested.dashboardAdminRoleIds) ||
+    JSON.stringify(existing.moderatorRoleIds) !==
+      JSON.stringify(requested.moderatorRoleIds) ||
+    existing.ticketStaffRoleId !== requested.ticketStaffRoleId;
+  if (
+    accessFieldsChanged &&
+    guild.ownerId !== actorId &&
+    !actor!.permissions.has(PermissionFlagsBits.ManageGuild)
+  )
+    return {
+      ok: false,
+      status: 403,
+      error: "Only the server owner or a member with Manage Server can change dashboard access roles",
+    };
+
+  const roleIds = new Set([
+    ...requested.dashboardAdminRoleIds,
+    ...requested.moderatorRoleIds,
+    requested.ticketStaffRoleId,
+    requested.autoRoleId,
+  ].filter(Boolean));
+  const roles = new Map<string, Role | undefined>();
+  await Promise.all(
+    [...roleIds].map(async (roleId) => {
+      const role = await guild.roles.fetch(roleId).catch(() => null);
+      roles.set(roleId, role ?? undefined);
+    }),
+  );
+  for (const roleId of roleIds) {
+    if (!isConfigurableRole(guild.id, roles.get(roleId)))
+      return {
+        ok: false,
+        status: 400,
+        error: "Configured roles must exist in this server, must not be managed, and cannot be @everyone",
+      };
+  }
+
+  if (requested.autoRoleId) {
+    const me = guild.members.me ??
+      await guild.members.fetchMe().catch(() => null);
+    const error = autoRoleError(guild.id, roles.get(requested.autoRoleId), me);
+    if (error) return { ok: false, status: 400, error };
+  }
+
+  if (actor && guild.ownerId !== actorId) {
+    const newlySelected = new Set([
+      ...requested.dashboardAdminRoleIds.filter(
+        (roleId) => !existing.dashboardAdminRoleIds.includes(roleId),
+      ),
+      ...requested.moderatorRoleIds.filter(
+        (roleId) => !existing.moderatorRoleIds.includes(roleId),
+      ),
+      ...(requested.ticketStaffRoleId !== existing.ticketStaffRoleId
+        ? [requested.ticketStaffRoleId]
+        : []),
+      ...(requested.autoRoleId !== existing.autoRoleId
+        ? [requested.autoRoleId]
+        : []),
+    ].filter(Boolean));
+    if (
+      [...newlySelected].some(
+        (roleId) => roles.get(roleId)!.position >= actor.roles.highest.position,
+      )
+    )
+      return {
+        ok: false,
+        status: 403,
+        error: "You cannot configure a role at or above your own highest role",
+      };
+  }
+  return { ok: true };
+}
+
 function auth(req: AuthedRequest, res: Response, next: NextFunction) {
   const token = req.cookies.astra_session as string | undefined;
   const session = token && getSession(token);
@@ -147,22 +249,25 @@ function auth(req: AuthedRequest, res: Response, next: NextFunction) {
 async function resolveGuildAccess(
   req: AuthedRequest,
   guildId = String(req.params.guildId),
+  includeTicketStaff = true,
 ): Promise<AccessLevel | null> {
   const oauthGuild = req.session?.guilds.find((item) => item.id === guildId);
   if (!oauthGuild) return null;
   const guild = bot.guilds.cache.get(guildId);
-  if (!guild) return canManage(oauthGuild) ? "admin" : null;
+  if (!guild) return null;
   const userId = req.session!.user.id;
   if (guild.ownerId === userId) return "admin";
   const member = await guild.members.fetch(userId).catch(() => null);
   if (!member) return null;
   if (member.permissions.has(PermissionFlagsBits.ManageGuild)) return "admin";
   const config = getGuildConfig(guildId);
-  if (config.dashboardAdminRoleIds.some((id) => member.roles.cache.has(id)))
+  if (hasConfiguredRole(member, config.dashboardAdminRoleIds, guildId))
     return "admin";
   if (
-    config.moderatorRoleIds.some((id) => member.roles.cache.has(id)) ||
-    (config.ticketStaffRoleId && member.roles.cache.has(config.ticketStaffRoleId))
+    hasConfiguredRole(member, config.moderatorRoleIds, guildId) ||
+    (includeTicketStaff &&
+      config.ticketStaffRoleId &&
+      hasConfiguredRole(member, [config.ticketStaffRoleId], guildId))
   )
     return "moderator";
   return null;
@@ -176,11 +281,8 @@ async function guildAuth(
   const access = await resolveGuildAccess(req);
   if (access !== "admin")
     return res.status(403).json({ error: "Administrator access required" });
-  const guild = bot.guilds.cache.get(String(req.params.guildId));
-  if (!guild) {
-    if (req.method === "GET") return next();
+  if (!bot.guilds.cache.has(String(req.params.guildId)))
     return res.status(404).json({ error: "Bot is not in this server" });
-  }
   req.accessLevel = access;
   next();
 }
@@ -191,6 +293,24 @@ async function moderatorAuth(
   next: NextFunction,
 ) {
   const access = await resolveGuildAccess(req);
+  if (!access)
+    return res.status(403).json({ error: "Moderator access required" });
+  if (!bot.guilds.cache.has(String(req.params.guildId)))
+    return res.status(404).json({ error: "Bot is not in this server" });
+  req.accessLevel = access;
+  next();
+}
+
+async function moderationAuth(
+  req: AuthedRequest,
+  res: Response,
+  next: NextFunction,
+) {
+  const access = await resolveGuildAccess(
+    req,
+    String(req.params.guildId),
+    false,
+  );
   if (!access)
     return res.status(403).json({ error: "Moderator access required" });
   if (!bot.guilds.cache.has(String(req.params.guildId)))
@@ -253,6 +373,7 @@ export function createWebServer() {
       discord: bot.isReady(),
       encryption:
         process.env.NODE_ENV !== "production" || encryptionAvailable(),
+      backup: backupHealthy(),
     };
     const ready = Object.values(checks).every(Boolean);
     res.status(ready ? 200 : 503).json({ status: ready ? "ready" : "not_ready", checks });
@@ -358,7 +479,9 @@ export function createWebServer() {
       });
       res.redirect("/");
     } catch (error) {
-      console.error(error);
+      structuredLog("error", "discord_oauth_callback_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
       res.status(502).send("Discord authentication failed. Please try again.");
     }
   });
@@ -374,11 +497,16 @@ export function createWebServer() {
     const guilds = (
       await Promise.all(
         req.session!.guilds.map(async (guild) => {
-          const accessLevel = await resolveGuildAccess(req, guild.id);
+          const botPresent = bot.guilds.cache.has(guild.id);
+          const accessLevel = botPresent
+            ? await resolveGuildAccess(req, guild.id)
+            : canManage(guild)
+              ? "admin"
+              : null;
           return accessLevel
             ? {
                 ...guild,
-                botPresent: bot.guilds.cache.has(guild.id),
+                botPresent,
                 accessLevel,
               }
             : null;
@@ -552,9 +680,10 @@ export function createWebServer() {
     });
   });
 
-  app.put("/api/guilds/:guildId/config", auth, guildAuth, (req: AuthedRequest, res) => {
+  app.put("/api/guilds/:guildId/config", auth, guildAuth, async (req: AuthedRequest, res) => {
     const guildId = String(req.params.guildId);
-    if (!bot.guilds.cache.has(guildId))
+    const guild = bot.guilds.cache.get(guildId);
+    if (!guild)
       return res.status(404).json({ error: "Bot is not in this server" });
     const existing = getGuildConfig(guildId);
     const config = preserveLockedConfig(
@@ -562,6 +691,14 @@ export function createWebServer() {
       sanitizeConfig(req.body),
       getPlanAccess(guildId).capabilities,
     );
+    const validation = await validateConfigRoles(
+      guild,
+      req.session!.user.id,
+      existing,
+      config,
+    );
+    if (!validation.ok)
+      return res.status(validation.status).json({ error: validation.error });
     saveGuildConfig(guildId, config);
     const changedFields = Object.keys(config).filter(
       (key) =>
@@ -624,6 +761,23 @@ export function createWebServer() {
         return res
           .status(400)
           .json({ error: "Choose a valid text channel and assignable role" });
+      const me =
+        guild.members.me ??
+        (await guild.members.fetchMe().catch(() => null));
+      if (me && role.position >= me.roles.highest.position)
+        return res.status(400).json({
+          error: "Astra cannot assign a role at or above its own highest role",
+        });
+      if (guild.ownerId !== req.session!.user.id) {
+        const invoker = await guild.members
+          .fetch(req.session!.user.id)
+          .catch(() => null);
+        if (!invoker || role.position >= invoker.roles.highest.position)
+          return res.status(403).json({
+            error:
+              "You cannot assign a role at or above your own highest role",
+          });
+      }
       const message = await channel.messages
         .fetch(messageId as string)
         .catch(() => null);
@@ -768,7 +922,12 @@ export function createWebServer() {
       if (!templates.includes(template) || req.body?.confirm !== true)
         return res.status(400).json({ error: "Template and explicit confirmation are required" });
       const guildId = String(req.params.guildId);
-      const config = previewTemplate(getGuildConfig(guildId), template);
+      const existing = getGuildConfig(guildId);
+      const config = preserveLockedConfig(
+        existing,
+        previewTemplate(existing, template),
+        getPlanAccess(guildId).capabilities,
+      );
       saveGuildConfig(guildId, config);
       addAuditEvent(guildId, req.session!.user.id, "setup.apply", {
         metadata: { template },
@@ -780,7 +939,7 @@ export function createWebServer() {
   app.get(
     "/api/guilds/:guildId/moderation",
     auth,
-    moderatorAuth,
+    moderationAuth,
     (req, res) => {
       const guildId = String(req.params.guildId);
       const limit = getPlanAccess(guildId).limits.moderationCases;
@@ -827,9 +986,10 @@ export function createWebServer() {
       const eligible = Boolean(
         member &&
           (member.permissions.has(PermissionFlagsBits.ManageGuild) ||
-            config.dashboardAdminRoleIds.some((role) => member.roles.cache.has(role)) ||
-            config.moderatorRoleIds.some((role) => member.roles.cache.has(role)) ||
-            (config.ticketStaffRoleId && member.roles.cache.has(config.ticketStaffRoleId))),
+            hasConfiguredRole(member, config.dashboardAdminRoleIds, guildId) ||
+            hasConfiguredRole(member, config.moderatorRoleIds, guildId) ||
+            (config.ticketStaffRoleId &&
+              hasConfiguredRole(member, [config.ticketStaffRoleId], guildId))),
       );
       if (!eligible) return res.status(400).json({ error: "Assignee is not support staff" });
       const ticket = assignTicket(guildId, id, assigneeId);
@@ -986,6 +1146,9 @@ export function createWebServer() {
     res.json({ url: `https://discord.com/oauth2/authorize?${query}` });
   });
 
+  app.all("/api/{*path}", (_req, res) =>
+    res.status(404).json({ error: "Not found" }),
+  );
   const dashboard = path.resolve("dist/dashboard");
   if (existsSync(dashboard)) {
     app.use(express.static(dashboard, { maxAge: "1d", index: false }));
@@ -996,7 +1159,9 @@ export function createWebServer() {
   app.use(
     (error: unknown, _req: Request, res: Response, next: NextFunction) => {
       void next;
-      console.error(error);
+      structuredLog("error", "http_request_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
       const candidate = error as { status?: unknown; statusCode?: unknown };
       const suppliedStatus = Number(candidate?.status || candidate?.statusCode);
       const status = Number.isInteger(suppliedStatus) && suppliedStatus >= 400 && suppliedStatus < 500

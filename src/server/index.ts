@@ -3,7 +3,11 @@ import type { Server } from "node:http";
 import { startBot } from "./bot.js";
 import { bot } from "./bot.js";
 import { createWebServer } from "./web.js";
-import { closeDatabase, purgeExpiredTranscripts } from "./database.js";
+import {
+  closeDatabase,
+  purgeExpiredTranscripts,
+  purgeOperationalData,
+} from "./database.js";
 import { gauge, log } from "./observability.js";
 import { InProcessJobScheduler } from "./jobs.js";
 import { validateRuntimeConfig } from "./runtime-config.js";
@@ -16,9 +20,15 @@ const jobs = new InProcessJobScheduler();
 const initialPurged = purgeExpiredTranscripts();
 if (initialPurged)
   log("info", "ticket_retention_purged", { purged: initialPurged });
+const initialMaintenance = purgeOperationalData();
+if (Object.values(initialMaintenance).some(Boolean))
+  log("info", "operational_retention_purged", initialMaintenance);
 jobs.recurring("ticket-transcript-retention", 60 * 60_000, () => {
   const purged = purgeExpiredTranscripts();
   if (purged) log("info", "ticket_retention_purged", { purged });
+  const maintenance = purgeOperationalData();
+  if (Object.values(maintenance).some(Boolean))
+    log("info", "operational_retention_purged", maintenance);
 });
 if (process.env.BACKUP_ENABLED === "true") {
   const intervalHours = Math.max(1, Number(process.env.BACKUP_INTERVAL_HOURS || 24));
@@ -38,11 +48,15 @@ startBot(token, clientId)
     log("error", "discord_startup_failed", {
       error: error instanceof Error ? error.message : String(error),
     });
-    process.exitCode = 1;
+    shutdown("DISCORD_STARTUP_FAILURE", server, 1);
   });
 
 let shuttingDown = false;
-function shutdown(signal: NodeJS.Signals, httpServer: Server = server) {
+function shutdown(
+  signal: NodeJS.Signals | "DISCORD_STARTUP_FAILURE",
+  httpServer: Server = server,
+  exitCode = 0,
+) {
   if (shuttingDown) return;
   shuttingDown = true;
   log("info", "shutdown_started", { signal });
@@ -58,7 +72,7 @@ function shutdown(signal: NodeJS.Signals, httpServer: Server = server) {
       closeDatabase();
       clearTimeout(forceTimer);
       log("info", "shutdown_complete", { signal });
-      process.exit(0);
+      process.exit(exitCode);
     } catch (error) {
       log("error", "shutdown_failed", {
         error: error instanceof Error ? error.message : String(error),

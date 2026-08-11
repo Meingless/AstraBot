@@ -12,10 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 22.23.2
           cache: npm
       - run: npm ci
       - run: npm run typecheck
@@ -27,7 +27,11 @@ jobs:
       - run: npm run test:e2e
       - run: npm audit --audit-level=moderate
       - name: Build production image
+        id: production_image
         run: docker build --tag astra:test .
+      - name: Build hardened Caddy image
+        id: caddy_image
+        run: docker build --file Dockerfile.caddy --tag astra-caddy:test .
       - name: Scan production image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -36,8 +40,24 @@ jobs:
           exit-code: 1
           ignore-unfixed: true
           severity: CRITICAL,HIGH
+      - name: Scan pinned Caddy image
+        if: ${{ always() && steps.caddy_image.outcome == 'success' }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: astra-caddy:test
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0
+        if: ${{ always() && steps.production_image.outcome == 'success' }}
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           image: astra:test
           artifact-name: astra-sbom.spdx.json
+      - name: Generate Caddy SBOM
+        if: ${{ always() && steps.caddy_image.outcome == 'success' }}
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: astra-caddy:test
+          artifact-name: astra-caddy-sbom.spdx.json

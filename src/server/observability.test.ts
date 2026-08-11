@@ -17,6 +17,21 @@ describe("observability", () => {
     expect(JSON.stringify(parsed)).not.toContain("private");
   });
 
+  it("redacts secrets embedded inside otherwise safe string fields", () => {
+    process.env.OBSERVABILITY_TEST_TOKEN = "embedded-secret-value";
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    log("error", "provider_failed", {
+      message:
+        "Bearer abc.def token=inline-secret endpoint?key=query-secret embedded-secret-value",
+    });
+    const rendered = String(output.mock.calls[0]?.[0]);
+    expect(rendered).not.toContain("abc.def");
+    expect(rendered).not.toContain("inline-secret");
+    expect(rendered).not.toContain("query-secret");
+    expect(rendered).not.toContain("embedded-secret-value");
+    delete process.env.OBSERVABILITY_TEST_TOKEN;
+  });
+
   it("renders counters and gauges in Prometheus format", () => {
     increment("test_counter", 2);
     gauge("test_gauge", 7);

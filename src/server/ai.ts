@@ -42,6 +42,23 @@ export function assertAiConnectionAllowed(connection: AiConnection) {
 let unavailableUntil = 0;
 let activeGenerations = 0;
 
+class AiProviderHttpError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// Only provider-side failures (HTTP 429, 5xx, network/timeout) trip the
+// circuit breaker; 4xx client errors (for example an invalid model chosen by
+// one guild) must not take the assistant down for every guild.
+function shouldTripCircuitBreaker(error: unknown) {
+  if (!(error instanceof AiProviderHttpError)) return true;
+  return error.status === 429 || error.status >= 500;
+}
+
 async function requestOpenAiCompatible(
   prompt: string,
   system: string,
@@ -83,7 +100,10 @@ async function requestOpenAiCompatible(
     }),
   });
   if (!response.ok)
-    throw new Error(`${connection.provider} returned ${response.status}`);
+    throw new AiProviderHttpError(
+      `${connection.provider} returned ${response.status}`,
+      response.status,
+    );
   const body = (await response.json()) as {
     choices?: Array<{ message?: { content?: string } }>;
   };
@@ -113,7 +133,11 @@ async function requestGemini(
       }),
     },
   );
-  if (!response.ok) throw new Error(`Gemini returned ${response.status}`);
+  if (!response.ok)
+    throw new AiProviderHttpError(
+      `Gemini returned ${response.status}`,
+      response.status,
+    );
   const body = (await response.json()) as {
     candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
   };
@@ -145,9 +169,9 @@ export async function generateText(
           );
     return output.trim().slice(0, 1800) || null;
   } catch (error) {
-    unavailableUntil = Date.now() + 30_000;
+    if (shouldTripCircuitBreaker(error)) unavailableUntil = Date.now() + 30_000;
     console.warn(
-      "AI generation API unavailable.",
+      "AI generation failed.",
       error instanceof Error ? error.message : error,
     );
     return null;
