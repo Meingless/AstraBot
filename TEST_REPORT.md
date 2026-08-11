@@ -34,6 +34,7 @@ Full production sign-off remains pending because no public domain, real S3-compa
 | Runtime file permissions | `.env`, SQLite, WAL/SHM, data directories | Owner-only (`0600`/`0700`) |
 | Secret leakage | `.env` secret values scanned against dashboard bundle | No leaks |
 | Discord configuration | Read-only `/users/@me`, application, and gateway REST checks | Pass |
+| GitHub Actions | PR CI run: tests, E2E, builds, Trivy, SBOM | Pass in 5m12s; both SBOM artifacts published |
 
 Coverage: 69.08% statements, 61.77% branches, 57.80% functions, and 72.43% lines overall. Server line coverage is 83.86%; SQLite is 89.38%, web API is 87.66%, backup format is 92.18%, backup restore is 93.93%, and crypto is 100% by lines. Browser tests additionally exercise responsive public routes, authenticated administrator behavior, background revalidation, keyboard focus, reduced motion, and visual output.
 
@@ -107,5 +108,4 @@ The previous local load run exercised `/health/live`, `/api/public/site-settings
 1. Supply a public `APP_DOMAIN`, matching Discord HTTPS callback, long session/metrics secrets, and separate 32-byte Base64 transcript/backup keys; then start Compose and confirm Caddy ACME issuance plus `/health/ready`.
 2. Supply S3-compatible credentials and confirm a real encrypted upload, retention policy, download, and restore drill. Local and mocked upload paths pass.
 3. In a dedicated Discord guild, exercise command permissions, channel overwrites, hierarchy failures, reaction add/remove, ticket panels, transcript downloads, and Turkish/English replies using real events.
-4. Confirm the first GitHub Actions run and download both generated SBOM artifacts. Local Trivy scans report zero HIGH/CRITICAL findings for both production images and npm audit reports zero vulnerabilities.
-5. Repository vulnerability alerts, automated security fixes, SHA-pinning enforcement, and read-only workflow permissions are enabled. Ruleset/branch-protection enforcement still requires a GitHub plan that supports it for this private repository.
+4. Repository vulnerability alerts, automated security fixes, SHA-pinning enforcement, and read-only workflow permissions are enabled. Ruleset/branch-protection enforcement still requires a GitHub plan that supports it for this private repository.
