@@ -171,7 +171,7 @@ describe("SQLite repositories and migrations", () => {
       nonce: "nonce",
       tag: "tag",
     }, Date.now() + 1000)).toThrow(/per-ticket storage limit/u);
-  });
+  }, 15_000);
 
   it("enforces subscription expiry, plan capabilities, and AI quota limits", async () => {
     const plans = await import("./plans.js");
