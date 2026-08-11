@@ -75,5 +75,21 @@ describe("backup lifecycle", () => {
     )).toBe(1);
     expect(statSync(unrelated).isFile()).toBe(true);
   });
-});
 
+  it("marks readiness unhealthy when required off-site upload fails", async () => {
+    process.env.BACKUP_ENABLED = "true";
+    const result = await modules.backup.runBackup({
+      directory: backupDirectory,
+      now: new Date("2026-08-10T12:00:00.000Z"),
+      upload: vi.fn().mockRejectedValue(new Error("off-site unavailable")),
+    });
+    expect(result.offsite).toBe(false);
+    expect(modules.backup.backupHealthy()).toBe(false);
+    await modules.backup.runBackup({
+      directory: backupDirectory,
+      now: new Date("2026-08-10T13:00:00.000Z"),
+    });
+    expect(modules.backup.backupHealthy()).toBe(true);
+    delete process.env.BACKUP_ENABLED;
+  });
+});

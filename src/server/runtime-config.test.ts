@@ -79,7 +79,37 @@ describe("runtime configuration", () => {
     })).toThrow(/S3 backup configuration/u);
     expect(() => validateRuntimeConfig({
       ...production,
+      BACKUP_S3_ENDPOINT: "https://minio.internal",
+    })).toThrow(/S3 backup configuration/u);
+    expect(() => validateRuntimeConfig({
+      ...production,
       BACKUP_S3_ENDPOINT: "http://minio.internal:9000",
+      BACKUP_S3_BUCKET: "astra-backups",
+      BACKUP_S3_REGION: "local",
+      BACKUP_S3_ACCESS_KEY_ID: "access",
+      BACKUP_S3_SECRET_ACCESS_KEY: "secret",
     })).toThrow(/HTTPS/u);
+  });
+
+  it("validates rotation keys and bounded backup retention", () => {
+    const oldDataKey = Buffer.alloc(32, 5).toString("base64");
+    const backupKey = Buffer.alloc(32, 7).toString("base64");
+    expect(validateRuntimeConfig({
+      ...production,
+      DATA_ENCRYPTION_PREVIOUS_KEYS: oldDataKey,
+      BACKUP_ENABLED: "true",
+      BACKUP_ENCRYPTION_KEY: backupKey,
+      BACKUP_ENCRYPTION_PREVIOUS_KEYS: Buffer.alloc(32, 8).toString("base64"),
+    })).toMatchObject({ port: 3000 });
+    expect(() => validateRuntimeConfig({
+      ...production,
+      DATA_ENCRYPTION_PREVIOUS_KEYS: production.DATA_ENCRYPTION_KEY,
+    })).toThrow(/must not repeat/u);
+    expect(() => validateRuntimeConfig({
+      ...production,
+      BACKUP_ENABLED: "true",
+      BACKUP_ENCRYPTION_KEY: backupKey,
+      BACKUP_INTERVAL_HOURS: "169",
+    })).toThrow(/at most 168/u);
   });
 });

@@ -6,6 +6,17 @@ import { defaultConfig, sanitizeConfig, type GuildConfig } from "./config.js";
 
 const databasePath = process.env.ASTRA_DB_PATH || "data/astra.db";
 
+export const STORAGE_LIMITS = {
+  auditEventsPerGuild: 5_000,
+  moderationCasesPerGuild: 2_500,
+  ticketsPerGuild: 1_000,
+  ticketsPerGuildPerDay: 250,
+  ticketsPerOwnerPerDay: 10,
+  transcriptPlaintextBytes: 2 * 1024 * 1024,
+  transcriptCiphertextCharsPerGuild: 16 * 1024 * 1024,
+  auditMetadataBytes: 16 * 1024,
+} as const;
+
 function openDatabase(): DatabaseSync {
   const previousUmask = process.umask(0o077);
   try {
@@ -17,6 +28,8 @@ function openDatabase(): DatabaseSync {
 }
 
 const db = openDatabase();
+const auditCounts = new Map<string, number>();
+const caseCounts = new Map<string, number>();
 if (databasePath !== ":memory:") {
   chmodSync(databasePath, 0o600);
 }
@@ -37,6 +50,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS reaction_roles (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL, emoji TEXT NOT NULL, role_id TEXT NOT NULL, UNIQUE(guild_id, message_id, emoji));
   CREATE TABLE IF NOT EXISTS custom_commands (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, name TEXT NOT NULL, response TEXT NOT NULL, UNIQUE(guild_id, name));
   CREATE TABLE IF NOT EXISTS moderation_cases (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, target_id TEXT NOT NULL, moderator_id TEXT NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL, created_at INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS moderation_cases_guild_created ON moderation_cases(guild_id, created_at DESC);
   CREATE TABLE IF NOT EXISTS site_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS guild_subscriptions (
     guild_id TEXT PRIMARY KEY,
@@ -135,6 +149,29 @@ function migrate() {
 
 migrate();
 
+function enforceGuildRowLimit(
+  table: "audit_events" | "moderation_cases",
+  counts: Map<string, number>,
+  guildId: string,
+  limit: number,
+) {
+  const known = counts.get(guildId);
+  const count = known === undefined
+    ? (db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE guild_id = ?`)
+        .get(guildId) as { count: number }).count
+    : known + 1;
+  if (count > limit) {
+    db.prepare(
+      `DELETE FROM ${table} WHERE id IN (
+        SELECT id FROM ${table} WHERE guild_id = ? ORDER BY id ASC LIMIT ?
+      )`,
+    ).run(guildId, count - limit);
+    counts.set(guildId, limit);
+  } else {
+    counts.set(guildId, count);
+  }
+}
+
 type DiscordUser = {
   id: string;
   username: string;
@@ -180,13 +217,17 @@ export function saveGuildConfig(guildId: string, config: GuildConfig) {
 }
 
 export function createSession(token: string, session: Session) {
-  db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(Date.now());
+  purgeExpiredSessions();
   db.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?)").run(
     sessionKey(token),
     JSON.stringify(session.user),
     JSON.stringify(session.guilds),
     session.expiresAt,
   );
+}
+
+export function purgeExpiredSessions(now = Date.now()) {
+  return db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(now).changes;
 }
 
 export function getSession(token: string): Session | null {
@@ -310,7 +351,20 @@ export function addCase(
 ) {
   db.prepare(
     "INSERT INTO moderation_cases (guild_id, target_id, moderator_id, action, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-  ).run(guildId, targetId, moderatorId, action, reason, Date.now());
+  ).run(
+    guildId,
+    targetId.slice(0, 80),
+    moderatorId.slice(0, 80),
+    action.slice(0, 80),
+    reason.slice(0, 500),
+    Date.now(),
+  );
+  enforceGuildRowLimit(
+    "moderation_cases",
+    caseCounts,
+    guildId,
+    STORAGE_LIMITS.moderationCasesPerGuild,
+  );
 }
 export function listCases(guildId: string, limit = 100) {
   return db
@@ -349,6 +403,9 @@ export function addAuditEvent(
     metadata?: Record<string, unknown>;
   } = {},
 ) {
+  let metadata = JSON.stringify(options.metadata || {});
+  if (Buffer.byteLength(metadata) > STORAGE_LIMITS.auditMetadataBytes)
+    metadata = JSON.stringify({ truncated: true });
   db.prepare(
     "INSERT INTO audit_events (guild_id, actor_id, action, target_id, channel_id, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   ).run(
@@ -357,8 +414,14 @@ export function addAuditEvent(
     action.slice(0, 80),
     options.targetId || null,
     options.channelId || null,
-    JSON.stringify(options.metadata || {}),
+    metadata,
     Date.now(),
+  );
+  enforceGuildRowLimit(
+    "audit_events",
+    auditCounts,
+    guildId,
+    STORAGE_LIMITS.auditEventsPerGuild,
   );
 }
 
@@ -473,9 +536,33 @@ export function createTicket(
   ownerId: string,
   ownerName: string,
 ) {
+  const since = Date.now() - 86_400_000;
+  const counts = db.prepare(
+    `SELECT
+       COUNT(*) AS total,
+       COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS daily,
+       COALESCE(SUM(CASE WHEN owner_id = ? AND created_at >= ? THEN 1 ELSE 0 END), 0) AS owner_daily
+     FROM tickets WHERE guild_id = ?`,
+  ).get(since, ownerId, since, guildId) as {
+    total: number;
+    daily: number;
+    owner_daily: number;
+  };
+  if (counts.total >= STORAGE_LIMITS.ticketsPerGuild)
+    throw new Error("Guild ticket storage limit reached");
+  if (counts.daily >= STORAGE_LIMITS.ticketsPerGuildPerDay)
+    throw new Error("Guild daily ticket limit reached");
+  if (counts.owner_daily >= STORAGE_LIMITS.ticketsPerOwnerPerDay)
+    throw new Error("Owner daily ticket limit reached");
   const result = db.prepare(
     "INSERT INTO tickets (guild_id, channel_id, owner_id, owner_name, status, created_at) VALUES (?, ?, ?, ?, 'open', ?)",
-  ).run(guildId, channelId, ownerId, ownerName.slice(0, 80), Date.now());
+  ).run(
+    guildId,
+    channelId.slice(0, 80),
+    ownerId.slice(0, 80),
+    ownerName.slice(0, 80),
+    Date.now(),
+  );
   return getTicketById(guildId, Number(result.lastInsertRowid))!;
 }
 
@@ -511,8 +598,9 @@ export function listTickets(
     values.push(filters.status);
   }
   if (filters.query) {
-    clauses.push("(owner_name LIKE ? OR owner_id LIKE ? OR assignee_id LIKE ? OR channel_id LIKE ?)");
-    const query = `%${filters.query.slice(0, 80)}%`;
+    clauses.push("(owner_name LIKE ? ESCAPE '\\' OR owner_id LIKE ? ESCAPE '\\' OR assignee_id LIKE ? ESCAPE '\\' OR channel_id LIKE ? ESCAPE '\\')");
+    const escaped = filters.query.slice(0, 80).replace(/[\\%_]/g, "\\$&");
+    const query = `%${escaped}%`;
     values.push(query, query, query, query);
   }
   if (filters.before) {
@@ -539,6 +627,22 @@ export function closeTicket(
   encrypted: { ciphertext: string; nonce: string; tag: string } | null,
   expiresAt: number | null,
 ) {
+  if (encrypted) {
+    const encodedSize =
+      encrypted.ciphertext.length + encrypted.nonce.length + encrypted.tag.length;
+    const maximumSingleCiphertext =
+      Math.ceil(STORAGE_LIMITS.transcriptPlaintextBytes / 3) * 4 + 128;
+    if (encodedSize > maximumSingleCiphertext)
+      throw new Error("Ticket transcript exceeds the per-ticket storage limit");
+    const current = db.prepare(
+      `SELECT COALESCE(SUM(
+        LENGTH(transcript_ciphertext) + LENGTH(transcript_nonce) + LENGTH(transcript_tag)
+      ), 0) AS used
+      FROM tickets WHERE guild_id = ? AND id != ?`,
+    ).get(guildId, id) as { used: number };
+    if (current.used + encodedSize > STORAGE_LIMITS.transcriptCiphertextCharsPerGuild)
+      throw new Error("Guild transcript storage limit reached");
+  }
   const result = db.prepare(
     "UPDATE tickets SET status = 'closed', closed_at = ?, transcript_ciphertext = ?, transcript_nonce = ?, transcript_tag = ?, transcript_expires_at = ? WHERE guild_id = ? AND id = ? AND status != 'closed'",
   ).run(
@@ -571,6 +675,21 @@ export function purgeExpiredTranscripts(now = Date.now()) {
   ).run(now).changes;
 }
 
+export function purgeOperationalData(now = Date.now()) {
+  const sessions = purgeExpiredSessions(now);
+  const ticketThreshold = now - 365 * 86_400_000;
+  const tickets = db.prepare(
+    `DELETE FROM tickets
+     WHERE status = 'closed' AND transcript_ciphertext IS NULL
+       AND closed_at IS NOT NULL AND closed_at <= ?`,
+  ).run(ticketThreshold).changes;
+  const usageThreshold = new Date(now - 60 * 86_400_000).toISOString().slice(0, 10);
+  const aiUsage = db.prepare(
+    "DELETE FROM ai_daily_usage WHERE usage_date < ?",
+  ).run(usageThreshold).changes;
+  return { sessions, tickets, aiUsage };
+}
+
 export function deleteGuildOperationalData(guildId: string) {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -585,6 +704,8 @@ export function deleteGuildOperationalData(guildId: string) {
     ])
       db.prepare(`DELETE FROM ${table} WHERE guild_id = ?`).run(guildId);
     db.exec("COMMIT");
+    auditCounts.delete(guildId);
+    caseCounts.delete(guildId);
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;

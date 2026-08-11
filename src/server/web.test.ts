@@ -1,7 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ChannelType, Collection } from "discord.js";
+import { ChannelType, Collection, PermissionFlagsBits } from "discord.js";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -11,11 +11,15 @@ describe("HTTP API, security, and role authorization", () => {
   let discord: typeof import("./bot.js");
   let channelStore: Collection<string, Record<string, unknown>>;
   let roleStore: Collection<string, Record<string, unknown>>;
+  let memberStore: Map<string, Record<string, unknown>>;
 
   const adminId = "111111111111111111";
   const moderatorId = "222222222222222222";
+  const ticketStaffId = "232323232323232323";
+  const lowAdminId = "242424242424242424";
   const adminRoleId = "333333333333333333";
   const moderatorRoleId = "444444444444444444";
+  const ticketStaffRoleId = "454545454545454545";
   const guildId = "555555555555555555";
 
   function createLogin(
@@ -62,19 +66,45 @@ describe("HTTP API, security, and role authorization", () => {
     config.dashboardAdminRoleIds = [adminRoleId];
     config.moderatorRoleIds = [moderatorRoleId];
     database.saveGuildConfig(guildId, config);
-    const members = new Map([
+    memberStore = new Map([
       [
         adminId,
         {
           permissions: { has: vi.fn().mockReturnValue(false) },
-          roles: { cache: new Map([[adminRoleId, {}]]) },
+          roles: {
+            cache: new Map([[adminRoleId, {}]]),
+            highest: { position: 10 },
+          },
         },
       ],
       [
         moderatorId,
         {
           permissions: { has: vi.fn().mockReturnValue(false) },
-          roles: { cache: new Map([[moderatorRoleId, {}]]) },
+          roles: {
+            cache: new Map([[moderatorRoleId, {}]]),
+            highest: { position: 10 },
+          },
+        },
+      ],
+      [
+        ticketStaffId,
+        {
+          permissions: { has: vi.fn().mockReturnValue(false) },
+          roles: {
+            cache: new Map([[ticketStaffRoleId, {}]]),
+            highest: { position: 2 },
+          },
+        },
+      ],
+      [
+        lowAdminId,
+        {
+          permissions: { has: vi.fn().mockReturnValue(false) },
+          roles: {
+            cache: new Map([[adminRoleId, {}]]),
+            highest: { position: 3 },
+          },
         },
       ],
     ]);
@@ -113,8 +143,47 @@ describe("HTTP API, security, and role authorization", () => {
       managed: false,
       position: 5,
       hexColor: "#8b5cf6",
+      permissions: { bitfield: 0n },
     };
-    roleStore = new Collection([[role.id, role]]);
+    const highRole = {
+      id: "404040404040404040",
+      name: "Senior",
+      managed: false,
+      position: 25,
+      hexColor: "#f59e0b",
+      permissions: { bitfield: 0n },
+    };
+    const dashboardAdminRole = {
+      id: adminRoleId,
+      name: "Dashboard Admin",
+      managed: false,
+      position: 10,
+      hexColor: "#8b5cf6",
+      permissions: { bitfield: 0n },
+    };
+    const moderatorRole = {
+      id: moderatorRoleId,
+      name: "Moderator",
+      managed: false,
+      position: 9,
+      hexColor: "#8b5cf6",
+      permissions: { bitfield: 0n },
+    };
+    const ticketStaffRole = {
+      id: ticketStaffRoleId,
+      name: "Ticket Staff",
+      managed: false,
+      position: 2,
+      hexColor: "#8b5cf6",
+      permissions: { bitfield: 0n },
+    };
+    roleStore = new Collection([
+      [role.id, role],
+      [highRole.id, highRole],
+      [dashboardAdminRole.id, dashboardAdminRole],
+      [moderatorRole.id, moderatorRole],
+      [ticketStaffRole.id, ticketStaffRole],
+    ]);
     discord.bot.guilds.cache.set(
       guildId,
       {
@@ -123,7 +192,10 @@ describe("HTTP API, security, and role authorization", () => {
         ownerId: "999999999999999999",
         preferredLocale: "en-US",
         memberCount: 42,
-        members: { fetch: vi.fn((id: string) => Promise.resolve(members.get(id) || null)) },
+        members: {
+          me: { roles: { highest: { position: 20 } } },
+          fetch: vi.fn((id: string) => Promise.resolve(memberStore.get(id) || null)),
+        },
         channels: {
           cache: channelStore,
           fetch: vi.fn((id?: string) =>
@@ -131,6 +203,7 @@ describe("HTTP API, security, and role authorization", () => {
           ),
         },
         roles: {
+          cache: roleStore,
           fetch: vi.fn((id?: string) =>
             Promise.resolve(id ? roleStore.get(id) || null : roleStore),
           ),
@@ -269,7 +342,7 @@ describe("HTTP API, security, and role authorization", () => {
       .get(`/api/guilds/${guildId}`)
       .set("Cookie", cookie)
       .expect(200);
-    expect(response.body.stats).toEqual({ members: 42, channels: 2, roles: 1 });
+    expect(response.body.stats).toEqual({ members: 42, channels: 2, roles: 5 });
     expect(response.body.channels).toContainEqual({
       id: "101010101010101010",
       name: "general",
@@ -278,7 +351,9 @@ describe("HTTP API, security, and role authorization", () => {
       id: "202020202020202020",
       name: "Support",
     });
-    expect(response.body.roles[0].name).toBe("Member");
+    expect(
+      response.body.roles.map((entry: { name: string }) => entry.name),
+    ).toContain("Member");
     expect(response.body).toHaveProperty("transcriptEncryptionAvailable", true);
   });
 
@@ -553,5 +628,200 @@ describe("HTTP API, security, and role authorization", () => {
     const cookie = createLogin("logout-session", adminId, [oauthGuild(guildId)]);
     await request(app).post("/api/auth/logout").set("Cookie", cookie).expect(204);
     await request(app).get("/api/me").set("Cookie", cookie).expect(401);
+  });
+
+  it("denies dashboard and export access once the bot leaves a guild", async () => {
+    const absentGuildId = "666666666666666666";
+    const cookie = createLogin("absent-session", adminId, [
+      oauthGuild(absentGuildId, "Absent Guild", true),
+    ]);
+    await request(app)
+      .get(`/api/guilds/${absentGuildId}`)
+      .set("Cookie", cookie)
+      .expect(403);
+    await request(app)
+      .get(`/api/guilds/${absentGuildId}/privacy/export`)
+      .set("Cookie", cookie)
+      .expect(403);
+    const me = await request(app)
+      .get("/api/me")
+      .set("Cookie", cookie)
+      .expect(200);
+    expect(me.body.guilds[0]).toMatchObject({
+      id: absentGuildId,
+      botPresent: false,
+      accessLevel: "admin",
+    });
+  });
+
+  it("rejects reaction roles at or above the invoker's or Astra's highest role", async () => {
+    const body = {
+      channelId: "101010101010101010",
+      messageId: "121212121212121212",
+      emoji: "🚀",
+    };
+    const lowCookie = createLogin("low-admin-session", lowAdminId, [oauthGuild(guildId)]);
+    const invokerRejected = await request(app)
+      .post(`/api/guilds/${guildId}/reaction-roles`)
+      .set("Cookie", lowCookie)
+      .send({ ...body, roleId: "303030303030303030" })
+      .expect(403);
+    expect(invokerRejected.body.error).toContain("your own highest role");
+    const adminCookie = createLogin("high-role-session", adminId, [oauthGuild(guildId)]);
+    const botRejected = await request(app)
+      .post(`/api/guilds/${guildId}/reaction-roles`)
+      .set("Cookie", adminCookie)
+      .send({ ...body, roleId: "404040404040404040" })
+      .expect(400);
+    expect(botRejected.body.error).toContain("its own highest role");
+  });
+
+  it("keeps @everyone inert and rejects it from dashboard access configuration", async () => {
+    const original = database.getGuildConfig(guildId);
+    const poisoned = {
+      ...original,
+      dashboardAdminRoleIds: [guildId],
+      moderatorRoleIds: [guildId],
+      ticketStaffRoleId: guildId,
+    };
+    database.saveGuildConfig(guildId, poisoned);
+    try {
+      const ordinaryCookie = createLogin("everyone-regression-session", adminId, [oauthGuild(guildId)]);
+      const me = await request(app)
+        .get("/api/me")
+        .set("Cookie", ordinaryCookie)
+        .expect(200);
+      expect(me.body.guilds).toEqual([]);
+      await request(app)
+        .get(`/api/guilds/${guildId}`)
+        .set("Cookie", ordinaryCookie)
+        .expect(403);
+
+      const ownerCookie = createLogin("everyone-owner-session", "999999999999999999", [
+        oauthGuild(guildId, "Test Guild", true),
+      ]);
+      await request(app)
+        .put(`/api/guilds/${guildId}/config`)
+        .set("Cookie", ownerCookie)
+        .send(poisoned)
+        .expect(400);
+    } finally {
+      database.saveGuildConfig(guildId, original);
+    }
+  });
+
+  it("allows only the owner or Manage Server members to delegate dashboard roles", async () => {
+    const original = database.getGuildConfig(guildId);
+    const requested = { ...original, ticketStaffRoleId };
+    const delegatedCookie = createLogin("delegation-admin-session", adminId, [oauthGuild(guildId)]);
+    const denied = await request(app)
+      .put(`/api/guilds/${guildId}/config`)
+      .set("Cookie", delegatedCookie)
+      .send(requested)
+      .expect(403);
+    expect(denied.body.error).toContain("Manage Server");
+
+    const ownerCookie = createLogin("delegation-owner-session", "999999999999999999", [
+      oauthGuild(guildId, "Test Guild", true),
+    ]);
+    await request(app)
+      .put(`/api/guilds/${guildId}/config`)
+      .set("Cookie", ownerCookie)
+      .send(requested)
+      .expect(200);
+    database.saveGuildConfig(guildId, original);
+  });
+
+  it("does not treat stale @everyone ticket staff as an eligible assignee", async () => {
+    const ordinaryId = "474747474747474747";
+    memberStore.set(ordinaryId, {
+      permissions: { has: vi.fn().mockReturnValue(false) },
+      roles: {
+        cache: new Map([[guildId, { id: guildId }]]),
+        highest: { position: 0 },
+      },
+    });
+    const original = database.getGuildConfig(guildId);
+    database.saveGuildConfig(guildId, { ...original, ticketStaffRoleId: guildId });
+    try {
+      const ticket = database.createTicket(
+        guildId,
+        "everyone-assignee-channel",
+        "everyone-assignee-owner",
+        "Owner",
+      );
+      const moderatorCookie = createLogin(
+        "everyone-assignee-moderator",
+        moderatorId,
+        [oauthGuild(guildId)],
+      );
+      await request(app)
+        .patch(`/api/guilds/${guildId}/tickets/${ticket.id}`)
+        .set("Cookie", moderatorCookie)
+        .send({ assigneeId: ordinaryId })
+        .expect(400, { error: "Assignee is not support staff" });
+    } finally {
+      database.saveGuildConfig(guildId, original);
+      memberStore.delete(ordinaryId);
+    }
+  });
+
+  it("rejects privileged and unassignable automatic roles", async () => {
+    const privilegedRoleId = "464646464646464646";
+    roleStore.set(privilegedRoleId, {
+      id: privilegedRoleId,
+      name: "Privileged",
+      managed: false,
+      position: 1,
+      hexColor: "#dc2626",
+      permissions: { bitfield: PermissionFlagsBits.Administrator },
+    });
+    const original = database.getGuildConfig(guildId);
+    const ownerCookie = createLogin("auto-role-owner-session", "999999999999999999", [
+      oauthGuild(guildId, "Test Guild", true),
+    ]);
+    const privileged = await request(app)
+      .put(`/api/guilds/${guildId}/config`)
+      .set("Cookie", ownerCookie)
+      .send({ ...original, autoRoleEnabled: true, autoRoleId: privilegedRoleId })
+      .expect(400);
+    expect(privileged.body.error).toContain("administrative or moderation");
+    const tooHigh = await request(app)
+      .put(`/api/guilds/${guildId}/config`)
+      .set("Cookie", ownerCookie)
+      .send({ ...original, autoRoleEnabled: true, autoRoleId: "404040404040404040" })
+      .expect(400);
+    expect(tooHigh.body.error).toContain("its own highest role");
+    roleStore.delete(privilegedRoleId);
+  });
+
+  it("keeps ticket staff out of moderation history but allows the ticket inbox", async () => {
+    const config = database.getGuildConfig(guildId);
+    config.ticketStaffRoleId = ticketStaffRoleId;
+    database.saveGuildConfig(guildId, config);
+    const staffCookie = createLogin("ticket-staff-session", ticketStaffId, [oauthGuild(guildId)]);
+    await request(app)
+      .get(`/api/guilds/${guildId}/moderation`)
+      .set("Cookie", staffCookie)
+      .expect(403);
+    await request(app)
+      .get(`/api/guilds/${guildId}/tickets`)
+      .set("Cookie", staffCookie)
+      .expect(200);
+    const moderatorCookie = createLogin("moderation-recheck-session", moderatorId, [oauthGuild(guildId)]);
+    await request(app)
+      .get(`/api/guilds/${guildId}/moderation`)
+      .set("Cookie", moderatorCookie)
+      .expect(200);
+  });
+
+  it("returns a JSON 404 for unknown API routes instead of the SPA fallback", async () => {
+    await request(app)
+      .get("/api/definitely-not-a-route")
+      .expect(404, { error: "Not found" });
+    await request(app)
+      .post("/api/definitely-not-a-route")
+      .send({})
+      .expect(404, { error: "Not found" });
   });
 });

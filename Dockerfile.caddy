@@ -1,0 +1,29 @@
+# Rebuild the pinned Caddy release with security-patched Go dependencies.
+FROM golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
+
+WORKDIR /src
+COPY caddy-build/go.mod caddy-build/go.sum ./
+RUN go mod download && go mod verify
+COPY caddy-build/main.go ./
+RUN CGO_ENABLED=0 go build -mod=readonly -trimpath \
+    -ldflags "-s -w -X github.com/caddyserver/caddy/v2.CustomVersion=v2.11.4-astra.1" \
+    -o /out/caddy .
+
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+ENV XDG_CONFIG_HOME=/config \
+    XDG_DATA_HOME=/data
+
+RUN apk add --no-cache ca-certificates mailcap \
+    && addgroup -S -g 1000 caddy \
+    && adduser -S -D -H -u 1000 -G caddy caddy \
+    && mkdir -p /etc/caddy /data /config \
+    && chown -R caddy:caddy /data /config
+COPY --from=builder /out/caddy /usr/bin/caddy
+
+EXPOSE 80 443 443/udp 2019
+VOLUME ["/data", "/config"]
+USER caddy
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/caddy"]
+CMD ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]

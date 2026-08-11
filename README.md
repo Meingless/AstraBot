@@ -15,15 +15,15 @@ A multi-server Discord bot with a secure, animated management panel. Server owne
 
 1. Set `APP_DOMAIN` to the public hostname and register `https://<APP_DOMAIN>/api/auth/callback` in Discord.
 2. Generate separate values with `openssl rand -base64 32` for `DATA_ENCRYPTION_KEY` and `BACKUP_ENCRYPTION_KEY`, plus long random `SESSION_SECRET` and `METRICS_TOKEN` values.
-3. Create owner-only `data/` and `backups/` directories, then set `BACKUP_ENABLED=true`.
+3. Set `BACKUP_ENABLED=true`; Compose creates/fixes owner-only `data/` and `backups/` bind-mount permissions through a one-shot init service.
 4. Run `docker compose up --build -d`. Caddy obtains/renews TLS and proxies to the internal Astra service; port 3000 is not published.
 5. Confirm `https://<APP_DOMAIN>/health/ready` and authenticated `/metrics`, then complete the dedicated Discord test-guild checklist.
 
-The application container uses a read-only root filesystem, drops Linux capabilities, and shuts down gracefully on SIGTERM. Invalid production secrets or a non-HTTPS/mismatched OAuth redirect stop startup before the port is opened.
+The application container uses a read-only root filesystem, drops Linux capabilities, and shuts down gracefully on SIGTERM. Caddy also runs unprivileged from a reproducible, patched Go build. Both services have memory, CPU, PID, and log-rotation limits. Invalid production secrets or a non-HTTPS/mismatched OAuth redirect stop startup before the port is opened.
 
 ### Backup and Restore
 
-`npm run ops:backup` creates a permission-restricted, encrypted, integrity-checked SQLite backup. Scheduled backups retain seven days locally by default. Supplying the complete `BACKUP_S3_*` group also exports each encrypted file to S3-compatible storage.
+`npm run ops:backup` creates a permission-restricted, streaming encrypted, integrity-checked SQLite backup. Scheduled backups retain seven days locally by default. Supplying the complete `BACKUP_S3_*` group, including its HTTPS endpoint, also streams each encrypted file to S3-compatible storage. When backups are enabled, readiness stays false until a complete local and configured off-site backup succeeds.
 
 Stop Astra before restore, preserve the encrypted source file, and run:
 
@@ -31,12 +31,14 @@ Stop Astra before restore, preserve the encrypted source file, and run:
 npm run ops:restore -- --file backups/astra-<timestamp>.db.enc --confirm RESTORE
 ```
 
-Restore validates the encryption tag and SQLite integrity before replacement and keeps the former database as `astra.db.before-restore`.
+Restore validates the encryption tag and SQLite integrity before replacement and atomically keeps the former database as `astra.db.before-restore`. It refuses to replace the live file if rollback creation fails or SQLite WAL/SHM files show that Astra did not stop cleanly.
+
+For key rotation, move the former active key to `DATA_ENCRYPTION_PREVIOUS_KEYS` or `BACKUP_ENCRYPTION_PREVIOUS_KEYS`, set a new active key, restart and verify, then remove the former key only after all retained transcripts or backups using it have expired or been re-created. Previous keys are decryption-only; new records always use the active key.
 
 ## Automation
 
 - Rich welcome and goodbye messages with `{user}`, `{username}`, `{server}`, and `{count}` placeholders
-- Automatic role assignment on join
+- Automatic role assignment on join, restricted to non-managed roles below Astra with only member-safe permissions
 - Configurable AutoMod for invite links, external links, banned words, and excessive caps
 - Flood, duplicate-message, mention-spam, and bounded ReDoS-analyzed regex AutoMod rules
 - Join Guard for newly created Discord accounts
@@ -47,7 +49,7 @@ Restore validates the encryption tag and SQLite integrity before replacement and
 - Moderation case/audit history, configurable moderator roles, and optional direct-message notifications
 - Slash commands: `/help`, `/ping`, `/server`, `/user`, `/warn`, `/kick`, `/ban`, `/timeout`, `/purge`, `/lock`, `/unlock`, `/ticket`, and AI-only `/ai ask`, `/ai summarize`, `/ai explain`
 - Gaming, Creator, Product/Support, and empty setup templates with Turkish/English guild localization
-- Ticket assignment, encrypted transcripts, configurable retention, search, export, and deletion controls
+- Ticket assignment, encrypted transcripts, configurable retention, search, export, deletion controls, and bounded per-guild storage/rate quotas
 - Privacy self-service plus health, readiness, structured logs, and protected metrics
 - Per-guild SQLite configuration and authenticated dashboard access
 
@@ -87,8 +89,9 @@ Only the key for the selected provider is required. Official provider keys are a
 
 ## Operations and Verification
 
-- `GET /health/live` reports liveness; `GET /health/ready` checks SQLite, Discord, and production transcript encryption.
+- `GET /health/live` reports liveness; `GET /health/ready` checks SQLite, Discord, production transcript encryption, and enabled backup success.
 - `GET /metrics` requires `Authorization: Bearer <METRICS_TOKEN>` and returns Prometheus-format counters.
 - `/privacy` provides the public TR/EN data-handling notice; guild export and owner-confirmed deletion live in the dashboard.
 - Run `npm run typecheck`, `npm run lint`, `npm run test:coverage`, `npm run build`, `npm run verify:build`, and `npm run test:e2e` before handoff. Browser tests cover public pages and authenticated dashboard behavior at desktop, tablet, and mobile sizes.
-- The production Docker image runs as the unprivileged `node` user.
+- The production Docker image runs as the unprivileged `node` user and excludes npm, npx, Yarn, and Corepack from the runtime filesystem.
+- CI pins actions and base images, scans both Astra and Caddy for HIGH/CRITICAL vulnerabilities, and publishes an SBOM for each image. Dependabot monitors npm, Go, Docker, and GitHub Actions dependencies.

@@ -1,7 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ChannelType, Collection, Events } from "discord.js";
+import { ChannelType, Collection, Events, PermissionFlagsBits } from "discord.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 describe("Discord command and ticket integration", () => {
@@ -189,6 +189,34 @@ describe("Discord command and ticket integration", () => {
     });
   });
 
+  it("contains Discord message and client errors instead of rejecting event handlers", async () => {
+    const guildId = "633456789012345679";
+    const config = database.getGuildConfig(guildId);
+    config.customCommandsEnabled = true;
+    database.saveGuildConfig(guildId, config);
+    database.saveCustomCommand(guildId, "explode", "Safe response");
+    const messageListener = discord.bot.listeners(Events.MessageCreate)[0] as (
+      message: unknown,
+    ) => Promise<void>;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(messageListener({
+      guild: { id: guildId, name: "Containment", memberCount: 1 },
+      author: { id: "member", username: "Member", bot: false },
+      member: {
+        id: "member",
+        guild: { id: guildId, ownerId: "owner" },
+        permissions: { has: vi.fn().mockReturnValue(false) },
+        roles: { cache: new Map() },
+      },
+      content: "!explode",
+      channel: { send: vi.fn().mockRejectedValue(new Error("Discord unavailable")) },
+    })).resolves.toBeUndefined();
+    expect(discord.bot.listenerCount(Events.Error)).toBeGreaterThan(0);
+    expect(() => discord.bot.emit(Events.Error, new Error("Gateway failure"))).not.toThrow();
+    expect(errors).toHaveBeenCalled();
+    errors.mockRestore();
+  });
+
   it("adds and removes Unicode reaction roles through Discord events", async () => {
     const guildId = "723456789012345678";
     database.addReactionRole({
@@ -234,6 +262,24 @@ describe("Discord command and ticket integration", () => {
       name: "Members Guild",
       ownerId: "owner",
       memberCount: 11,
+      roles: {
+        cache: new Map([
+          [
+            "member-role",
+            {
+              id: "member-role",
+              managed: false,
+              position: 1,
+              permissions: { bitfield: 0n },
+            },
+          ],
+        ]),
+        fetch: vi.fn(),
+      },
+      members: {
+        me: { roles: { highest: { position: 10 } } },
+        fetchMe: vi.fn(),
+      },
       channels: {
         fetch: vi.fn().mockResolvedValue({
           isTextBased: () => true,
@@ -304,6 +350,86 @@ describe("Discord command and ticket integration", () => {
     expect(kick).toHaveBeenCalledWith("Astra Join Guard: account too new");
   });
 
+  it("refuses a privileged auto-role even if stale configuration reaches runtime", async () => {
+    const guildId = "933456789012345679";
+    const roleId = "933456789012345680";
+    const config = database.getGuildConfig(guildId);
+    config.autoRoleEnabled = true;
+    config.autoRoleId = roleId;
+    database.saveGuildConfig(guildId, config);
+    const roleAdd = vi.fn().mockResolvedValue(undefined);
+    const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const listener = discord.bot.listeners(Events.GuildMemberAdd)[0] as (
+      member: unknown,
+    ) => Promise<void>;
+    await listener({
+      id: "new-user",
+      guild: {
+        id: guildId,
+        name: "Privileged Auto Role",
+        memberCount: 1,
+        roles: {
+          cache: new Map([[roleId, {
+            id: roleId,
+            managed: false,
+            position: 1,
+            permissions: { bitfield: PermissionFlagsBits.Administrator },
+          }]]),
+        },
+        members: { me: { roles: { highest: { position: 10 } } } },
+        channels: { fetch: vi.fn() },
+      },
+      user: { username: "New", tag: "New#0001", createdTimestamp: 0 },
+      roles: { add: roleAdd },
+      send: vi.fn(),
+      kick: vi.fn(),
+      toString: () => "<@new-user>",
+    });
+    expect(roleAdd).not.toHaveBeenCalled();
+    expect(warnings).toHaveBeenCalled();
+    warnings.mockRestore();
+  });
+
+  it("does not let stale @everyone ticket staff close another user's ticket", async () => {
+    const guildId = "943456789012345679";
+    const channelId = "943456789012345680";
+    database.setGuildSubscription(guildId, "standard", null);
+    const config = database.getGuildConfig(guildId);
+    config.ticketsEnabled = true;
+    config.ticketStaffRoleId = guildId;
+    database.saveGuildConfig(guildId, config);
+    const ticket = database.createTicket(guildId, channelId, "owner", "Owner");
+    const guild = {
+      id: guildId,
+      ownerId: "server-owner",
+      members: {
+        fetch: vi.fn().mockResolvedValue({
+          id: "ordinary",
+          guild: { id: guildId, ownerId: "server-owner" },
+          permissions: { has: vi.fn().mockReturnValue(false) },
+          roles: { cache: new Map([[guildId, { id: guildId }]]) },
+        }),
+      },
+    };
+    const reply = vi.fn().mockResolvedValue(undefined);
+    await discord.handleTicketButton({
+      isButton: () => true,
+      customId: "astra_ticket_close",
+      guild,
+      channel: {
+        id: channelId,
+        type: ChannelType.GuildText,
+        topic: "astra-ticket:owner",
+      },
+      user: { id: "ordinary", username: "Ordinary", tag: "Ordinary#0001" },
+      memberPermissions: { has: vi.fn().mockReturnValue(false) },
+      reply,
+    } as never);
+    expect(database.getTicketById(guildId, ticket.id)?.status).toBe("open");
+    const response = reply.mock.calls[0]?.[0] as { content: string };
+    expect(response.content).toContain("permission");
+  });
+
   it("executes help, AI plan denial, warning, and permission checks", async () => {
     const guildId = "133456789012345678";
     const moderatorId = "moderator";
@@ -316,9 +442,13 @@ describe("Discord command and ticket integration", () => {
       id: moderatorId,
       guild: { id: guildId, ownerId: "owner" },
       permissions: { has: vi.fn().mockReturnValue(true) },
-      roles: { cache: new Map() },
+      roles: { cache: new Map(), highest: { position: 10 } },
     };
-    const targetMember = {};
+    const targetMember = {
+      id: "target",
+      moderatable: true,
+      roles: { highest: { position: 1 } },
+    };
     const guild = {
       id: guildId,
       name: "Commands",
@@ -496,5 +626,177 @@ describe("Discord command and ticket integration", () => {
     ) => Promise<void>;
     await listener(before, after);
     expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects kick, ban, and timeout when the target matches or outranks the invoker", async () => {
+    const guildId = "143456789012345678";
+    const invoker = {
+      id: "junior",
+      guild: { id: guildId, ownerId: "owner" },
+      permissions: { has: vi.fn().mockReturnValue(true) },
+      roles: { cache: new Map(), highest: { position: 5 } },
+    };
+    const target = { id: "senior", username: "Senior", send: vi.fn().mockResolvedValue(undefined) };
+    const targetMember = {
+      id: "senior",
+      moderatable: true,
+      kick: vi.fn().mockResolvedValue(undefined),
+      ban: vi.fn().mockResolvedValue(undefined),
+      timeout: vi.fn().mockResolvedValue(undefined),
+      roles: { highest: { position: 5 } },
+    };
+    const guild = {
+      id: guildId,
+      name: "Hierarchy",
+      ownerId: "owner",
+      members: {
+        fetch: vi.fn((id: string) =>
+          Promise.resolve(id === "junior" ? invoker : targetMember),
+        ),
+      },
+    };
+    const run = async (commandName: string) => {
+      const reply = vi.fn().mockResolvedValue(undefined);
+      await discord.handleCommand({
+        isChatInputCommand: () => true,
+        guild,
+        user: { id: "junior", username: "Junior" },
+        commandName,
+        reply,
+        options: {
+          getUser: () => target,
+          getString: () => null,
+          getInteger: () => 5,
+        },
+      } as never);
+      return reply;
+    };
+    for (const commandName of ["kick", "ban", "timeout"]) {
+      const reply = await run(commandName);
+      expect(reply).toHaveBeenCalledOnce();
+      const lastReply = reply.mock.calls.at(-1)?.[0] as { content: string };
+      expect(lastReply.content).toContain("permission");
+    }
+    expect(targetMember.kick).not.toHaveBeenCalled();
+    expect(targetMember.ban).not.toHaveBeenCalled();
+    expect(targetMember.timeout).not.toHaveBeenCalled();
+
+    targetMember.roles.highest.position = 1;
+    const reply = await run("kick");
+    const lastReply = reply.mock.calls.at(-1)?.[0] as { content: string };
+    expect(lastReply.content).toContain("Action completed");
+    expect(targetMember.kick).toHaveBeenCalledOnce();
+  });
+
+  it("does not treat ManageMessages alone as sufficient for ban", async () => {
+    const guildId = "153456789012345678";
+    const invoker = {
+      id: "mod",
+      guild: { id: guildId, ownerId: "owner" },
+      permissions: {
+        has: vi.fn((bit: bigint) => bit === PermissionFlagsBits.ManageMessages),
+      },
+      roles: { cache: new Map(), highest: { position: 5 } },
+    };
+    const target = { id: "target", username: "Target", send: vi.fn().mockResolvedValue(undefined) };
+    const targetMember = {
+      id: "target",
+      moderatable: true,
+      ban: vi.fn().mockResolvedValue(undefined),
+      roles: { highest: { position: 1 } },
+    };
+    const guild = {
+      id: guildId,
+      name: "Permissions",
+      ownerId: "owner",
+      members: {
+        fetch: vi.fn((id: string) =>
+          Promise.resolve(id === "mod" ? invoker : targetMember),
+        ),
+      },
+    };
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const interaction = {
+      isChatInputCommand: () => true,
+      guild,
+      user: { id: "mod", username: "Mod" },
+      commandName: "ban",
+      reply,
+      options: {
+        getUser: () => target,
+        getString: () => null,
+        getInteger: () => 5,
+      },
+    };
+    await discord.handleCommand(interaction as never);
+    const lastReply = reply.mock.calls.at(-1)?.[0] as { content: string };
+    expect(lastReply.content).toContain("permission");
+    expect(targetMember.ban).not.toHaveBeenCalled();
+
+    interaction.commandName = "warn";
+    await discord.handleCommand(interaction as never);
+    expect(database.listCases(guildId)[0]).toMatchObject({ action: "warn" });
+  });
+
+  it("rejects moderation actions against the server owner", async () => {
+    const guildId = "163456789012345678";
+    const invoker = {
+      id: "admin",
+      guild: { id: guildId, ownerId: "owner" },
+      permissions: { has: vi.fn().mockReturnValue(true) },
+      roles: { cache: new Map(), highest: { position: 10 } },
+    };
+    const target = { id: "owner", username: "Owner", send: vi.fn() };
+    const targetMember = {
+      id: "owner",
+      moderatable: true,
+      kick: vi.fn(),
+      ban: vi.fn(),
+      timeout: vi.fn(),
+      roles: { highest: { position: 1 } },
+    };
+    const guild = {
+      id: guildId,
+      name: "Owner Guard",
+      ownerId: "owner",
+      members: {
+        fetch: vi.fn((id: string) =>
+          Promise.resolve(id === "admin" ? invoker : targetMember),
+        ),
+      },
+    };
+    for (const commandName of ["warn", "kick", "ban", "timeout"]) {
+      const reply = vi.fn().mockResolvedValue(undefined);
+      await discord.handleCommand({
+        isChatInputCommand: () => true,
+        guild,
+        user: { id: "admin", username: "Admin" },
+        commandName,
+        reply,
+        options: {
+          getUser: () => target,
+          getString: () => "Reason",
+          getInteger: () => 5,
+        },
+      } as never);
+      expect(reply).toHaveBeenCalledOnce();
+      const lastReply = reply.mock.calls.at(-1)?.[0] as { content: string };
+      expect(lastReply.content).toContain("permission");
+    }
+    expect(targetMember.kick).not.toHaveBeenCalled();
+    expect(targetMember.ban).not.toHaveBeenCalled();
+    expect(targetMember.timeout).not.toHaveBeenCalled();
+  });
+
+  it("declares default member permissions on destructive moderation commands", () => {
+    const expected: Record<string, bigint> = {
+      kick: PermissionFlagsBits.KickMembers,
+      ban: PermissionFlagsBits.BanMembers,
+      timeout: PermissionFlagsBits.ModerateMembers,
+    };
+    for (const [name, permission] of Object.entries(expected)) {
+      const command = discord.commandDefinitions.find((item) => item.name === name);
+      expect(command?.default_member_permissions).toBe(String(permission));
+    }
   });
 });

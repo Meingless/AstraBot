@@ -91,4 +91,47 @@ describe("AI assistant provider client", () => {
     ).resolves.toBeNull();
     expect(warning).toHaveBeenCalled();
   });
+
+  it("does not trip the circuit breaker on provider 4xx client errors", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("invalid model", { status: 400 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ choices: [{ message: { content: "Recovered" } }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const { generateText } = await freshAi();
+    const connection = { provider: "openai" as const, model: "bad-model", baseUrl: "" };
+    await expect(generateText("question", connection)).resolves.toBeNull();
+    // A 400 must not open the circuit: the next request still reaches the provider.
+    await expect(generateText("question", connection)).resolves.toBe("Recovered");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("trips the circuit breaker on provider 5xx and network errors", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const connection = { provider: "openai" as const, model: "test", baseUrl: "" };
+
+    const serverErrorFetch = vi.fn()
+      .mockResolvedValue(new Response("boom", { status: 500 }));
+    vi.stubGlobal("fetch", serverErrorFetch);
+    const { generateText } = await freshAi();
+    await expect(generateText("question", connection)).resolves.toBeNull();
+    // The circuit is open, so the retry is rejected without calling fetch.
+    await expect(generateText("question", connection)).resolves.toBeNull();
+    expect(serverErrorFetch).toHaveBeenCalledTimes(1);
+
+    const networkErrorFetch = vi.fn()
+      .mockRejectedValue(new TypeError("fetch failed"));
+    vi.stubGlobal("fetch", networkErrorFetch);
+    const networkAi = await freshAi();
+    await expect(networkAi.generateText("question", connection)).resolves.toBeNull();
+    await expect(networkAi.generateText("question", connection)).resolves.toBeNull();
+    expect(networkErrorFetch).toHaveBeenCalledTimes(1);
+  });
 });

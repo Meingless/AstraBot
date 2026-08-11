@@ -7,7 +7,8 @@ playwright-report/
 playwright.config.ts
 data/
 backups/
-.env
+.env*
+!.env.example
 .agents/
 .codex/
 *.log

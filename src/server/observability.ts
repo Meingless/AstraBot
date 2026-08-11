@@ -5,7 +5,25 @@ type Level = "info" | "warn" | "error";
 const counters = new Map<string, number>();
 const gauges = new Map<string, number>();
 
+function cleanString(value: string) {
+  let sanitized = value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/giu, "Bearer [REDACTED]")
+    .replace(
+      /(^|[?&\s])((?:token|secret|password|key)=)[^&\s]+/giu,
+      "$1$2[REDACTED]",
+    );
+  const configuredSecrets = Object.entries(process.env)
+    .filter(([key, item]) =>
+      /(token|secret|password|key)/iu.test(key) && Boolean(item && item.length >= 8),
+    )
+    .map(([, item]) => item!);
+  for (const secret of configuredSecrets)
+    sanitized = sanitized.split(secret).join("[REDACTED]");
+  return sanitized.slice(0, 2_000);
+}
+
 function clean(value: unknown): unknown {
+  if (typeof value === "string") return cleanString(value);
   if (Array.isArray(value)) return value.map(clean);
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(
